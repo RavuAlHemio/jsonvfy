@@ -19,7 +19,7 @@ pub enum JsonToken {
     True,
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum JsonChar {
     Byte(u8),
     EscapedQuote,
@@ -40,6 +40,9 @@ pub enum Error {
     InvalidUnicodeEscape([u8; 4]),
     InvalidNumberCharacter(u8),
     InvalidBarewordBeginning(String),
+    InvalidUtf8Sequence(Vec<JsonChar>),
+    Utf8SequenceProducedSurrogate(u32),
+    InvalidUtf16SurrogateSequence(Vec<JsonChar>),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -49,6 +52,9 @@ impl fmt::Display for Error {
             Self::InvalidUnicodeEscape(c) => write!(f, "invalid Unicode escape value {}{}{}{}", c[0], c[1], c[2], c[3]),
             Self::InvalidNumberCharacter(c) => write!(f, "invalid number character {:?}", c),
             Self::InvalidBarewordBeginning(s) => write!(f, "invalid bareword beginning {:?}", s),
+            Self::InvalidUtf8Sequence(seq) => write!(f, "invalid UTF-8 sequence {:?}", seq),
+            Self::Utf8SequenceProducedSurrogate(sur) => write!(f, "UTF-8 sequence produced surrogate 0x{:04X}", sur),
+            Self::InvalidUtf16SurrogateSequence(seq) => write!(f, "invalid UTF-16 surrogate sequence {:?}", seq),
         }
     }
 }
@@ -60,6 +66,9 @@ impl std::error::Error for Error {
             Self::InvalidUnicodeEscape(_) => None,
             Self::InvalidNumberCharacter(_) => None,
             Self::InvalidBarewordBeginning(_) => None,
+            Self::InvalidUtf8Sequence(_) => None,
+            Self::Utf8SequenceProducedSurrogate(_) => None,
+            Self::InvalidUtf16SurrogateSequence(_) => None,
         }
     }
 }
@@ -381,4 +390,145 @@ pub fn read_next_token<R: BufRead>(mut json_reader: R) -> Result<Option<JsonToke
         }
         return Err(Error::InvalidBarewordBeginning(bareword_begin));
     }
+}
+
+
+fn get_next_json_char_byte<'a, I: Iterator<Item = &'a JsonChar>>(previous_bytes: &[u8], iter: &mut I) -> Result<u8, Error> {
+    match iter.next() {
+        Some(JsonChar::Byte(b2)) if *b2 & 0b1100_0000 == 0b1000_0000 => Ok(*b2),
+        Some(other) => {
+            // invalid continuation of a UTF-8 sequence
+            let mut sequence_chars: Vec<JsonChar> = previous_bytes.iter()
+                .map(|b| JsonChar::Byte(*b))
+                .collect();
+            sequence_chars.push(*other);
+            Err(Error::InvalidUtf8Sequence(sequence_chars))
+        },
+        None => {
+            // UTF-8 sequence ended abruptly
+            let sequence_chars: Vec<JsonChar> = previous_bytes.iter()
+                .map(|b| JsonChar::Byte(*b))
+                .collect();
+            Err(Error::InvalidUtf8Sequence(sequence_chars))
+        },
+    }
+}
+
+
+pub fn interpret_string(json_chars: &[JsonChar]) -> Result<String, Error> {
+    let mut chars = Vec::with_capacity(json_chars.len());
+
+    let mut iter = json_chars.into_iter();
+    while let Some(json_char) = iter.next() {
+        match *json_char {
+            JsonChar::Byte(b) => {
+                // process as UTF-8
+                if b & 0b1000_0000 == 0b0000_0000 {
+                    // 0bbb_bbbb
+                    chars.push(char::from_u32(b.into()).unwrap());
+                } else if b & 0b1110_0000 == 0b1100_0000 {
+                    // 110b_bbbb 10bb_bbbb
+                    let b2 = get_next_json_char_byte(&[b], &mut iter)?;
+                    let char_value =
+                        u32::from(b & 0b0001_1111) << 6
+                        | u32::from(b2 & 0b0011_1111) << 0
+                    ;
+                    let c = match char::from_u32(char_value) {
+                        Some(c) => c,
+                        None => {
+                            // value represents a UTF-16 surrogate -- invalid in UTF-8
+                            return Err(Error::Utf8SequenceProducedSurrogate(char_value));
+                        },
+                    };
+                    chars.push(c);
+                } else if b & 0b1111_0000 == 0b1110_0000 {
+                    // 1110_bbbb 10bb_bbbb 10bb_bbbb
+                    let b2 = get_next_json_char_byte(&[b], &mut iter)?;
+                    let b3 = get_next_json_char_byte(&[b, b2], &mut iter)?;
+                    let char_value =
+                        u32::from(b & 0b0000_1111) << 12
+                        | u32::from(b2 & 0b0011_1111) << 6
+                        | u32::from(b3 & 0b0011_1111) << 0
+                    ;
+                    let c = match char::from_u32(char_value) {
+                        Some(c) => c,
+                        None => {
+                            // value represents a UTF-16 surrogate -- invalid in UTF-8
+                            return Err(Error::Utf8SequenceProducedSurrogate(char_value));
+                        },
+                    };
+                    chars.push(c);
+                } else if b & 0b1111_1000 == 0b1111_0000 {
+                    // 1111_0bbb 10bb_bbbb 10bb_bbbb 10bb_bbbb
+                    let b2 = get_next_json_char_byte(&[b], &mut iter)?;
+                    let b3 = get_next_json_char_byte(&[b, b2], &mut iter)?;
+                    let b4 = get_next_json_char_byte(&[b, b2, b3], &mut iter)?;
+                    let char_value =
+                        u32::from(b & 0b0000_0111) << 18
+                        | u32::from(b2 & 0b0011_1111) << 12
+                        | u32::from(b3 & 0b0011_1111) << 6
+                        | u32::from(b4 & 0b0011_1111) << 0
+                    ;
+                    let c = match char::from_u32(char_value) {
+                        Some(c) => c,
+                        None => {
+                            // value represents a UTF-16 surrogate -- invalid in UTF-8
+                            return Err(Error::Utf8SequenceProducedSurrogate(char_value));
+                        },
+                    };
+                    chars.push(c);
+                } else {
+                    return Err(Error::InvalidUtf8Sequence(vec![JsonChar::Byte(b)]));
+                }
+            },
+            JsonChar::EscapedQuote => {
+                chars.push('"');
+            },
+            JsonChar::EscapedBackslash => {
+                chars.push('\\');
+            },
+            JsonChar::EscapedSlash => {
+                chars.push('/');
+            },
+            JsonChar::EscapedBackspace => {
+                chars.push('\u{08}');
+            },
+            JsonChar::EscapedFormFeed => {
+                chars.push('\u{0C}');
+            },
+            JsonChar::EscapedLineFeed => {
+                chars.push('\n');
+            },
+            JsonChar::EscapedCarriageReturn => {
+                chars.push('\r');
+            },
+            JsonChar::EscapedTab => {
+                chars.push('\t');
+            },
+            JsonChar::UnicodeEscape(u) => {
+                // process as UTF-16
+                if u >= 0xD800 && u <= 0xDBFF {
+                    // leading surrogate; check for trailing surrogate
+                    let u2 = match iter.next() {
+                        Some(JsonChar::UnicodeEscape(u2)) if *u2 >= 0xDC00 && u <= 0xDFFF => *u2,
+                        Some(other) => return Err(Error::InvalidUtf16SurrogateSequence(vec![JsonChar::UnicodeEscape(u), *other])),
+                        None => return Err(Error::InvalidUtf16SurrogateSequence(vec![JsonChar::UnicodeEscape(u)])),
+                    };
+                    let char_value =
+                        0x1_0000
+                        + (u32::from(u - 0xD800) << 10)
+                        + u32::from(u2 - 0xDC00)
+                    ;
+                    chars.push(char::from_u32(char_value).unwrap());
+                } else if u >= 0xDC00 && u <= 0xDFFF {
+                    // trailing surrogate without a leading surrogate
+                    return Err(Error::InvalidUtf16SurrogateSequence(vec![JsonChar::UnicodeEscape(u)]));
+                } else {
+                    // non-surrogate BMP UTF-16 escape
+                    chars.push(char::from_u32(u.into()).unwrap());
+                }
+            },
+        }
+    }
+    Ok(String::from_iter(chars.into_iter()))
 }

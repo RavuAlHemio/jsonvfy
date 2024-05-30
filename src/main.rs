@@ -37,6 +37,10 @@ fn main() -> ExitCode {
         }
         ExitCode::SUCCESS
     } else {
-        verify(&mut reader)
+        if verify(&mut reader) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        }
     }
 }
