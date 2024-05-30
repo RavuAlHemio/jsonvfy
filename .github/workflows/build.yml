@@ -1,0 +1,77 @@
+name: jsonvfy build
+on: [push]
+jobs:
+  build-arch-debug:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - name: update packages
+        run: pacman -Syu --noconfirm
+      - name: install packages
+        run: pacman -S --needed --noconfirm cargo git
+      - name: check out repository code
+        uses: actions/checkout@v4
+      - name: run debug build
+        run: cargo build --all-targets
+      - name: run debug tests
+        run: cargo test
+      - name: upload debug binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsonvfy-debug
+          path: |
+            target/debug/jsonvfy
+  build-arch-release:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - name: update packages
+        run: pacman -Syu --noconfirm
+      - name: install packages
+        run: pacman -S --needed --noconfirm cargo git
+      - name: check out repository code
+        uses: actions/checkout@v4
+      - name: run release build
+        run: cargo build --all-targets --release
+      - name: run release tests
+        run: cargo test --release
+      - name: upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsonvfy-release
+          path: |
+            target/release/jsonvfy
+  build-ubuntu-noble-release:
+    runs-on: ubuntu-latest
+    container: ubuntu:noble
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      DEBIAN_FRONTEND: noninteractive
+      TZ: Etc/UTC
+      RUST_BACKTRACE: 1
+    steps:
+      - name: update apt database
+        run: apt-get -y update
+      - name: update packages
+        run: apt-get -y dist-upgrade
+      - name: install packages
+        run: apt-get -y install curl build-essential git
+      - name: install rustup
+        run: "curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y"
+      - name: check out repository code
+        uses: actions/checkout@v4
+      - name: run release build
+        run: '. $HOME/.cargo/env && cargo build --all-targets --release'
+      - name: run release tests
+        run: '. $HOME/.cargo/env && cargo test --release'
+      - name: upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsonvfy-release-ubuntu-focal
+          path: |
+            target/release/jsonvfy
